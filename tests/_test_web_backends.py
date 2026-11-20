@@ -215,6 +215,72 @@ class WebBackendTests(unittest.TestCase):
         self.assertIn("error", result)
         self.assertEqual(self.search_server.requests, [])
 
+    def test_fetch_backend_inherits_legacy_settings_and_can_override_search(self):
+        for backend, inherited in (("local", "local"), ("qoder", "qoder"), ("external", "local")):
+            cfg = {"backend": backend}
+            self.assertEqual(W.tool_backend(cfg, W.WEB_FETCH_NAME), inherited)
+            for fetch_backend in ("local", "qoder", "external"):
+                separate = dict(cfg, fetch_backend=fetch_backend)
+                self.assertEqual(W.tool_backend(separate, W.WEB_SEARCH_NAME), backend)
+                self.assertEqual(W.tool_backend(separate, W.WEB_FETCH_NAME), fetch_backend)
+        S.set_web_tools_config(self.path, {"enabled": True, "backend": "local", "fetch_backend": "external",
+            "external_fetch": {"endpoint": self.search_server.url + "/fetch", "api_key": "fetch-only-secret"}})
+        snapshot = W.backend_config(self.path, ready=True)
+        S.set_web_tools_config(self.path, {"external_fetch": {"title_path": "data.title"}})
+        self.assertEqual(S.web_tools_config(self.path)["external_fetch"]["api_key"], "fetch-only-secret")
+        self.assertEqual(snapshot["external_fetch"]["title_path"], "title")
+        public = P.web_tools_settings_view()
+        self.assertEqual(public["web_fetch_backend"], "external")
+        self.assertTrue(public["web_fetch_external"]["api_key_set"])
+        self.assertNotIn("fetch-only-secret", json.dumps(public))
+        S.set_web_tools_config(self.path, {"external_fetch": {"api_key": ""}})
+        self.assertFalse(P.web_tools_settings_view()["web_fetch_external"]["api_key_set"])
+
+    def test_external_fetch_http_contract_get_post_and_size_limit(self):
+        url = "https://example.com/page?part=1&sort=new"
+        self.search_server.payload = json.dumps({"data": {"markdown": "X" * (W.MAX_FETCH_CHARS + 1),
+            "title": "<b>Public title</b>", "finalUrl": "https://example.com/final"}}).encode()
+        profile = {"endpoint": self.search_server.url + "/fetch", "url_field": "target",
+                   "text_path": "data.markdown", "title_path": "data.title", "final_url_path": "data.finalUrl",
+                   "params": {"target": "fixed-value", "mode": "read"}, "api_key": "only-fetch-key",
+                   "auth_header": "X-Fetch-Key", "auth_prefix": ""}
+        for method in ("GET", "POST"):
+            with self.subTest(method=method), mock.patch.object(W, "check_url", return_value=(True, "")) as check:
+                result = E.fetch(dict(profile, method=method), url)
+                self.assertTrue(result["ok"], result)
+                self.assertEqual((result["url"], result["title"], result["truncated"], len(result["text"])),
+                                 (url, "Public title", True, W.MAX_FETCH_CHARS))
+                self.assertEqual([c.args[0] for c in check.call_args_list], [url, "https://example.com/final"])
+                req = self.search_server.requests[-1]
+                sent = (json.loads(req["body"]) if method == "POST" else
+                        dict(urllib.parse.parse_qsl(urllib.parse.urlsplit(req["path"]).query)))
+                self.assertEqual(sent, {"target": url, "mode": "read"})
+                self.assertEqual(dict((k.lower(), v) for k, v in req["headers"].items())["x-fetch-key"], "only-fetch-key")
+
+    def test_external_fetch_target_and_response_remain_bounded(self):
+        profile = {"endpoint": self.search_server.url + "/fetch", "final_url_path": "url"}
+        self.assertFalse(E.fetch(profile, "http://127.0.0.1/")["ok"])
+        self.assertEqual(self.search_server.requests, [])
+        self.search_server.payload = json.dumps({"url": "http://127.0.0.1/", "text": "private fixture text"}).encode()
+        with mock.patch.object(W, "check_url", return_value=(True, "")):
+            result = E.fetch(profile, "https://example.com/public")
+            self.assertFalse(result["ok"])
+            self.assertNotIn("text", result)
+            result = E.fetch(dict(profile, endpoint=self.search_server.url + "/redirect", api_key="fetch-only-key"),
+                             "https://example.com/public")
+            self.assertFalse(result["ok"])
+        self.assertEqual([r["path"] for r in self.search_server.requests], ["/fetch", "/redirect"])
+
+    def test_fetch_validation_is_atomic_when_enabled(self):
+        S.set_web_tools_config(self.path, {"enabled": True, "backend": "local"})
+        before = S.load(self.path)
+        for invalid in ({"fetch_backend": "external"},
+                        {"fetch_backend": "external", "external_fetch": {"endpoint": "file:///fixture"}},
+                        {"fetch_backend": "local", "external_fetch": {"unknown": "x"}}):
+            with self.assertRaises(ValueError):
+                S.set_web_tools_config(self.path, dict(invalid, backend="qoder"))
+            self.assertEqual(S.load(self.path), before)
+
     def test_real_panel_http_auth_save_and_legacy_toggle(self):
         server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), P.Handler)
         thread = threading.Thread(target=server.serve_forever, daemon=True)
@@ -241,6 +307,13 @@ class WebBackendTests(unittest.TestCase):
         self.assertTrue(data["web_tools"])
         self.assertEqual(data["web_tools_backend"], "external")
         self.assertNotIn("private-test-key", json.dumps(data))
+        status, data = call({"fetch_backend": "external", "external_fetch": {
+            "endpoint": self.search_server.url + "/fetch", "api_key": "private-fetch-key"}})
+        self.assertEqual(status, 200)
+        self.assertEqual(data["web_tools_backend"], "external")
+        self.assertEqual(data["web_fetch_backend"], "external")
+        self.assertTrue(data["web_fetch_external"]["api_key_set"])
+        self.assertNotIn("private-fetch-key", json.dumps(data))
         status, data = call({"enabled": False})
         self.assertEqual(status, 200)
         self.assertFalse(data["web_tools"])

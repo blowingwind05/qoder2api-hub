@@ -9108,6 +9108,8 @@ def web_tools_settings_view():
     return {"web_tools_backend": backend_env or config["backend"],
             "web_tools_backend_env": backend_env,
             "web_tools_enabled_env": (os.environ.get("QD_WEB_TOOLS") or "").strip().lower(),
+            "web_fetch_backend": config["fetch_backend"],
+            "web_fetch_external": qoder_external_web.public_profile(config["external_fetch"]),
             "web_tools_external": qoder_external_web.public_profile(config["external"]),
             "web_tools_external_profiles": {name: qoder_external_web.public_profile(profile)
                 for name, profile in config["external_profiles"].items()}}
@@ -14024,7 +14026,7 @@ class Handler(BaseHTTPRequestHandler):
             else:
                 declared_tools = list(payload.get("tools") or [])
             evidence = web_request.evidence if web_request else qoder_web_response.WebEvidence(declared_tools)
-            web_config = qoder_webtools.backend_config(ACCOUNTS_DIR, ready=True)
+            web_config = qoder_webtools.backend_config(ACCOUNTS_DIR, ready=True, names=names)
             call_limit = sum(web_request.limits.values()) if web_request else payload.get("max_tool_calls", 8)
             if type(call_limit) is not int or call_limit < 0:
                 raise ValueError("max_tool_calls must be a non-negative integer")
