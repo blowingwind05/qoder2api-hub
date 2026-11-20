@@ -672,6 +672,31 @@ class HostedWebHTTPTests(unittest.TestCase):
         self.assertEqual(json.loads(body)["content"][1]["content"]["error_code"], "url_not_in_prior_context")
         self.assertEqual(count, 0)
 
+    def test_custom_fetch_is_used_in_all_protocols_independently_of_official_search(self):
+        import qoder_external_web
+
+        url = "https://example.com/reference"
+        fetch = dict(call("web_fetch", {"url": url}), index=0)
+        rounds = [self.anthropic_round({"tool_calls": [fetch]}, "tool_calls"),
+                  self.anthropic_round({"content": "Got it [S1]."})]
+        with tempfile.TemporaryDirectory() as directory, mock.patch.object(P, "ACCOUNTS_DIR", directory):
+            P.qoder_settings.set_web_tools_config(directory, {"enabled": True, "fetch_backend": "external",
+                "external_fetch": {"endpoint": "http://fetcher:8080/fetch", "text_path": "data.markdown"}})
+            for path in self.HOSTED_PATHS:
+                with self.subTest(path=path), mock.patch.object(qoder_external_web, "_json_request",
+                        return_value={"data": {"markdown": "Fetched by the configured service"}}) as remote:
+                    payload = self.hosted_payload(path)
+                    history = payload.get("messages") or payload["input"]
+                    history[0]["content"] = "Read " + url
+                    payload["tools"][0] = ({"type": "web_fetch_20250910", "name": "web_fetch"}
+                                            if path.endswith("/messages") else {"type": "web_fetch"})
+                    body, inference, official_calls = self.post_hosted(path, payload, rounds)
+                    self.assertEqual(official_calls, 0)
+                    self.assertIn("Fetched by the configured service", inference[-1]["messages"][-1]["content"])
+                    self.assertIn("Got it", body)
+                    self.assertEqual(remote.call_args.args[:3], ("http://fetcher:8080/fetch", "POST", {"url": url}))
+                    remote.assert_called_once()
+
     def test_anthropic_mixed_batch_waits_for_client_results_and_replays_once(self):
         account = SimpleNamespace(uid="continuation-account", access_token="fake-test-token", realm="cn",
             realm_config=lambda: {"gateway": "https://gateway.qoder.com.cn", "vpc_instance": ""})
