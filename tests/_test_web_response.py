@@ -448,11 +448,13 @@ class HostedWebHTTPTests(unittest.TestCase):
         run_tool.assert_not_called()
         return body, infer.call_args.args[0]
 
-    def post_anthropic(self, payload, rounds, *, expected_status=200, fetched=None, account=None):
+    def post_anthropic(self, payload, rounds, *, expected_status=200, fetched=None, account=None,
+                       headers=None):
         return self.post_hosted("/v1/messages", payload, rounds, expected_status=expected_status,
-                                fetched=fetched, account=account)
+                                fetched=fetched, account=account, headers=headers)
 
-    def post_hosted(self, path, payload, rounds, *, expected_status=200, fetched=None, account=None):
+    def post_hosted(self, path, payload, rounds, *, expected_status=200, fetched=None, account=None,
+                    headers=None):
         account = account or SimpleNamespace(uid="test-scope", access_token="fake-test-token", realm="cn",
             realm_config=lambda: {"gateway": "https://gateway.qoder.com.cn", "vpc_instance": ""})
         upstreams = []
@@ -468,7 +470,8 @@ class HostedWebHTTPTests(unittest.TestCase):
             conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)
             try:
                 conn.request("POST", path, body=json.dumps(payload), headers={
-                    "Content-Type": "application/json", "x-api-key": "web-http-key", "anthropic-version": "2023-06-01"})
+                    "Content-Type": "application/json", "x-api-key": "web-http-key",
+                    "anthropic-version": "2023-06-01", **(headers or {})})
                 with conn.getresponse() as resp:
                     body = resp.read().decode()
                     self.assertEqual(resp.status, expected_status, body)
@@ -696,6 +699,163 @@ class HostedWebHTTPTests(unittest.TestCase):
                     self.assertIn("Got it", body)
                     self.assertEqual(remote.call_args.args[:3], ("http://fetcher:8080/fetch", "POST", {"url": url}))
                     remote.assert_called_once()
+
+    def test_anthropic_hosted_choices_enforced_before_dispatch(self):
+        payload = self.hosted_payload("/v1/messages")
+        ordinary = self.anthropic_round({"tool_calls": [
+            dict(call("lookup_order", {"order": 17}, "call_order"), index=0)]}, "tool_calls")
+        search = self.anthropic_round({"tool_calls": [dict(call(), index=0)]}, "tool_calls")
+        text = self.anthropic_round({"content": "Done"})
+        forced = dict(payload, tool_choice={"type": "tool", "name": "lookup_order"})
+        body, requests, count = self.post_anthropic(forced, [ordinary])
+        self.assertEqual((json.loads(body)["stop_reason"], count), ("tool_use", 0))
+        self.assertEqual(requests[0]["tool_choice"], "lookup_order")
+        self.assertEqual([t["function"]["name"] for t in requests[0]["tools"]], ["lookup_order"])
+        for wrong in (text, search):
+            _, requests, count = self.post_anthropic(forced, [wrong], expected_status=502)
+            self.assertEqual((len(requests), count), (1, 0))
+        forced_search = dict(payload, tool_choice={"type": "tool", "name": "web_search"})
+        truncated = self.anthropic_round(ordinary[0]["choices"][0]["delta"], "length")
+        body, _, count = self.post_anthropic(forced_search, [truncated])
+        message = json.loads(body)
+        self.assertEqual((message["stop_reason"], message["content"], count), ("max_tokens", [], 0))
+        missing = dict(payload, tool_choice={"type": "tool", "name": "missing"})
+        _, requests, count = self.post_anthropic(missing, [], expected_status=400)
+        self.assertEqual((requests, count), ([], 0))
+
+        disabled = dict(payload, tool_choice={"type": "none"})
+        # Even a misbehaving upstream must neither execute nor expose a tool.
+        for result, status in ((text, 200), (ordinary, 502), (search, 502)):
+            _, requests, count = self.post_anthropic(disabled, [result], expected_status=status)
+            self.assertEqual((requests[0]["tools"], requests[0]["tool_choice"], count), ([], "none", 0))
+        with mock.patch.object(P, "web_tools_enabled", return_value=False), \
+                mock.patch.object(W, "backend_config", side_effect=AssertionError("none must not load the backend")):
+            self.post_anthropic(disabled, [text])
+
+        required = dict(payload, tool_choice={"type": "any"})
+        _, requests, count = self.post_anthropic(required, [text], expected_status=502)
+        self.assertEqual((requests[0]["tool_choice"], count), ("required", 0))
+        body, _, count = self.post_anthropic(required, [ordinary])
+        self.assertEqual((json.loads(body)["stop_reason"], count), ("tool_use", 0))
+        _, requests, count = self.post_anthropic(required, [search, text])
+        self.assertEqual(([req["tool_choice"] for req in requests], count), (["required", "auto"], 1))
+        single = dict(payload, tool_choice={"type": "any", "disable_parallel_tool_use": True})
+        mixed = self.anthropic_round({"tool_calls": [dict(call(), index=0),
+            dict(call("lookup_order", {"order": 17}, "call_order"), index=1)]}, "tool_calls")
+        _, requests, count = self.post_anthropic(single, [mixed], expected_status=502)
+        self.assertIs(requests[0]["parallel_tool_calls"], False)
+        self.assertEqual(count, 0)
+
+    def test_anthropic_hosted_rounds_share_max_tokens_and_stop_at_zero(self):
+        payload = dict(self.hosted_payload("/v1/messages"), max_tokens=20)
+        first = self.anthropic_round({"tool_calls": [dict(call(), index=0)]}, "tool_calls")
+        first += [{"choices": [], "usage": {"prompt_tokens": 10, "completion_tokens": 7}}]
+        second = self.anthropic_round({"tool_calls": [
+            dict(call(args={"query": "other"}), index=0)]}, "tool_calls")
+        second += [{"choices": [], "usage": {"prompt_tokens": 13, "completion_tokens": 4}}]
+        final = self.anthropic_round({"content": "Done"})
+        final += [{"choices": [], "usage": {"prompt_tokens": 15, "completion_tokens": 3}}]
+        body, requests, count = self.post_anthropic(payload, [first, second, final])
+        self.assertEqual(([req["max_tokens"] for req in requests], count), ([20, 13, 9], 2))
+        self.assertEqual(json.loads(body)["usage"]["output_tokens"], 14)
+
+        body, requests, count = self.post_anthropic(dict(payload, max_tokens=7), [first])
+        self.assertEqual((json.loads(body)["stop_reason"], len(requests), count), ("max_tokens", 1, 0))
+        self.assertEqual(json.loads(body)["content"], [])
+        _, requests, count = self.post_anthropic(payload | {"max_tokens": 64}, [first[:1], final])
+        self.assertLess(requests[1]["max_tokens"], requests[0]["max_tokens"])
+        self.assertEqual(count, 1)
+
+    def test_anthropic_preserves_preambles_and_mixed_call_order_in_json_and_sse(self):
+        payload = self.hosted_payload("/v1/messages")
+        search = self.anthropic_round({"content": "Checking sources first.", "tool_calls": [
+            dict(call(), index=0)]}, "tool_calls")
+        search += [{"choices": [], "usage": {"completion_tokens": 10}}]
+        mixed = self.anthropic_round({"content": "Checking the order next.", "tool_calls": [
+            dict(call("lookup_order", {"order": 17}, "call_order"), index=0),
+            dict(call(args={"query": "another"}), index=1),
+            dict(call("lookup_order", {"order": 18}, "call_other"), index=2)]}, "tool_calls")
+        mixed += [{"choices": [], "usage": {"completion_tokens": 20}}]
+        expected = ["text", "server_tool_use", "web_search_tool_result", "text",
+                    "tool_use", "server_tool_use", "tool_use"]
+        for stream in (False, True):
+            with self.subTest(stream=stream):
+                body, _, count = self.post_anthropic(dict(payload, stream=stream), [search, mixed])
+                if stream:
+                    events = [json.loads(line[6:]) for line in body.splitlines() if line.startswith("data: ")]
+                    blocks = [event["content_block"] for event in events if event["type"] == "content_block_start"]
+                    texts = [event["delta"]["text"] for event in events if event["type"] == "content_block_delta"
+                             and event["delta"]["type"] == "text_delta"]
+                    self.assertEqual(events[-2]["delta"]["stop_reason"], "tool_use")
+                    self.assertEqual(events[-1]["type"], "message_stop")
+                else:
+                    message = json.loads(body)
+                    blocks = message["content"]
+                    texts = [block["text"] for block in blocks if block["type"] == "text"]
+                    self.assertEqual(message["stop_reason"], "tool_use")
+                self.assertEqual([block["type"] for block in blocks], expected)
+                self.assertEqual(texts, ["Checking sources first.", "Checking the order next."])
+                self.assertEqual([block["id"] for block in blocks if block["type"] == "tool_use"],
+                                 ["call_order", "call_other"])
+                self.assertEqual(count, 1)
+
+    @staticmethod
+    def resume_messages(payload, reply, client_id="call_order"):
+        return dict(payload, messages=payload["messages"] + [
+            {"role": "assistant", "content": reply["content"]},
+            {"role": "user", "content": [{"type": "tool_result", "tool_use_id": client_id, "content": "Found"}]},
+        ])
+
+    def test_anthropic_deferred_batch_counts_toward_round_and_token_limits(self):
+        payload = dict(self.hosted_payload("/v1/messages"), max_tokens=30)
+        mixed = self.anthropic_round({"tool_calls": [dict(call(), index=0),
+            dict(call("lookup_order", {"order": 17}, "call_order"), index=1)]}, "tool_calls")
+        mixed += [{"choices": [], "usage": {"prompt_tokens": 10, "completion_tokens": 9}}]
+        final = self.anthropic_round({"content": "Done"})
+        with mock.patch.object(P, "WEB_TOOLS_MAX_ROUNDS", 1):
+            body, _, count = self.post_anthropic(payload, [mixed])
+            self.assertEqual(count, 0)
+            resume = self.resume_messages(payload, json.loads(body))
+            body, requests, count = self.post_anthropic(resume, [final])
+            self.assertEqual((requests[0]["max_tokens"], count), (21, 1))
+            self.assertEqual([tool["function"]["name"] for tool in requests[0]["tools"]], ["lookup_order"])
+            self.assertEqual([block["type"] for block in json.loads(body)["content"]],
+                             ["web_search_tool_result", "text"])
+            body, requests, count = self.post_anthropic(dict(resume, max_tokens=6), [final])
+            self.assertEqual((requests[0]["max_tokens"], count), (6, 0))
+
+    def test_anthropic_deferred_batch_rechecks_unpinned_realm_and_account_scope(self):
+        payload = self.hosted_payload("/v1/messages")
+        mixed = self.anthropic_round({"tool_calls": [dict(call(), index=0),
+            dict(call("lookup_order", {"order": 17}, "call_order"), index=1)]}, "tool_calls")
+        final = self.anthropic_round({"content": "Done"})
+        cn = A.Account({"uid": "resume-cn", "realm": "cn", "accessToken": "fake-cn"})
+        intl = A.Account({"uid": "resume-intl", "realm": "intl", "accessToken": "fake-intl"})
+        with tempfile.TemporaryDirectory() as directory:
+            pool = A.AccountPool(directory, log=lambda *a, **k: None)
+            pool.accounts = [cn, intl]
+            with mock.patch.multiple(P, ACCOUNTS_DIR=directory, POOL=pool, CURRENT_REALM="cn"):
+                body, _, _ = self.post_anthropic(payload, [mixed], account=cn)
+                automatic = self.resume_messages(payload, json.loads(body))
+                body, _, _ = self.post_anthropic(payload, [mixed], account=cn, headers={"X-Realm": "cn"})
+                pinned = self.resume_messages(payload, json.loads(body))
+                P.qoder_routing.save_rules(directory, [
+                    {"id": "changed-region", "model": "*", "realm": "intl", "enabled": True}])
+                body, requests, count = self.post_anthropic(automatic, [], account=cn, expected_status=403)
+                self.assertIn("outside routing scope", body)
+                self.assertEqual((requests, count), ([], 0))
+                _, requests, count = self.post_anthropic(pinned, [final], account=cn, headers={"X-Realm": "cn"})
+                self.assertEqual((len(requests), count), (1, 1))
+
+                P.qoder_routing.save_rules(directory, [
+                    {"id": "changed-accounts", "model": "*", "accounts": [intl.uid], "enabled": True}])
+                _, requests, count = self.post_anthropic(automatic, [], account=cn, expected_status=403)
+                self.assertEqual((requests, count), ([], 0))
+                P.qoder_routing.save_rules(directory, [])
+                with mock.patch.multiple(P, CURRENT_REALM="intl"), \
+                        mock.patch.object(P, "detect_model_realm", return_value="intl"):
+                    _, requests, count = self.post_anthropic(automatic, [], account=cn, expected_status=403)
+                self.assertEqual((requests, count), ([], 0))
 
     def test_anthropic_mixed_batch_waits_for_client_results_and_replays_once(self):
         account = SimpleNamespace(uid="continuation-account", access_token="fake-test-token", realm="cn",

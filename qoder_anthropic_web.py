@@ -111,8 +111,8 @@ class WebRequest:
         messages, self.resume = self._join_deferred(payload.get("messages") or [])
         self.payload = dict(payload, tools=ordinary, messages=self._restore(messages))
 
-    def defer(self, calls, client_calls, account, config):
-        batch = DeferredWeb(self, calls, client_calls, account, config)
+    def defer(self, calls, client_calls, account, config, *, rounds, tokens_left):
+        batch = DeferredWeb(self, calls, client_calls, account, config, rounds, tokens_left)
         with _deferred_lock:
             _prune_deferred()
             _deferred[batch.id] = batch
@@ -266,6 +266,20 @@ class WebRequest:
         return None
 
 
+def completion_tokens(usage, message):
+    reported = usage.get("completion_tokens")
+    if type(reported) is int and reported > 0:
+        return reported
+    # Usage can be missing. Count visible UTF-8 bytes rather than giving
+    # the next round a fresh budget or guessing a tokenizer's compression.
+    parts = [message.get("content"), message.get("reasoning_content")]
+    for call in message.get("tool_calls") or []:
+        function = call.get("function") or {}
+        parts.extend((function.get("name"), function.get("arguments")))
+    return max(1, sum(len(part.encode("utf-8", "replace")) for part in parts
+                      if isinstance(part, str)))
+
+
 def _prune_deferred():
     now = time.monotonic()
     while _deferred and next(iter(_deferred.values())).expires_at <= now:
@@ -273,7 +287,7 @@ def _prune_deferred():
 
 
 class DeferredWeb:
-    def __init__(self, request, calls, client_calls, account, config):
+    def __init__(self, request, calls, client_calls, account, config, rounds, tokens_left):
         self.id = _DEFERRED_PREFIX + uuid.uuid4().hex
         self.expires_at = time.monotonic() + _DEFERRED_TTL
         self.scope = request.scope
@@ -284,6 +298,8 @@ class DeferredWeb:
                       for name in request.limits}
         self.account = account
         self.config = config
+        self.rounds = rounds
+        self.tokens_left = tokens_left
         self.client_ids = {call["id"] for call in client_calls}
         self.blocks = [dict(type="server_tool_use", id=self.id + "_" + str(i),
                             name=call["function"]["name"], input=parse_arguments(call["function"].get("arguments")))
@@ -403,16 +419,32 @@ class WebOutput:
                                               "data": result.get("text") or ""}}}
         self.append({"type": _RESULT_TYPES[name], "tool_use_id": tool_id, "content": content})
 
-    def finish(self, chat):
+    def _annotate(self, block):
+        if block["type"] == "text":
+            block["text"] = self.request.evidence.render(block["text"])
+            urls = dict.fromkeys(a["url"] for a in self.request.evidence.annotations(block["text"]))
+            citations = [self.citations[url] for url in urls if url in self.citations]
+            if citations:
+                block["citations"] = citations
+        return block
+
+    def tool_round(self, chat, hosted_names, deferred=None):
+        blocks = qoder_anthropic.chat_to_messages(
+            chat, self.model, thinking_mode_override=self.thinking)["content"]
+        pending = iter(deferred.blocks) if deferred else None
+        for block in blocks:
+            if block["type"] == "tool_use" and block["name"] in hosted_names:
+                if pending is not None:
+                    self.append(next(pending))
+            else:
+                self.append(self._annotate(block))
+
+    def finish(self, chat, *, content_emitted=False):
         message = qoder_anthropic.chat_to_messages(chat, self.model, thinking_mode_override=self.thinking)
         if (chat.get("choices") or [{}])[0].get("finish_reason") == "content_filter":
             message["stop_reason"] = "refusal"
-        for block in message["content"]:
-            if block["type"] == "text":
-                urls = dict.fromkeys(a["url"] for a in self.request.evidence.annotations(block["text"]))
-                citations = [self.citations[url] for url in urls if url in self.citations]
-                if citations:
-                    block["citations"] = citations
+        message["content"] = ([] if content_emitted else
+                              [self._annotate(block) for block in message["content"]])
         usage = message["usage"]
         if self.request.usage:
             usage["server_tool_use"] = {name + "_requests": count for name, count in self.request.usage.items()}
