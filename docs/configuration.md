@@ -284,9 +284,9 @@ Redis 仅开放 Compose 内部网络，数据由专用命名卷保存。
 | 看板「设置 → 联网工具」 | 总开关、后端及外部服务配置保存在 `accounts/settings.json`；点击「保存并应用」后，新请求立即生效 |
 | `QD_WEB_TOOLS=on/off` | 环境变量优先于面板开关 |
 | `QD_WEB_TOOLS_ROUNDS` | 代跑轮次上限，默认 3 |
-| `QD_WEB_TOOLS_BACKEND=local/qoder/external` | 可选强制覆盖面板后端，面板会显示并锁定该选择。未设置时使用面板保存的后端，默认 `local`。要恢复面板控制，移除此环境变量后重启一次 |
+| `QD_WEB_TOOLS_BACKEND=local/qoder/external` | 覆盖搜索后端。网页抓取选择「沿用搜索设置」时也会受影响。未设置时以面板为准，默认 `local` |
 
-面板中的三种后端：
+网页抓取可以独立选择「网关直接抓取」「Qoder 官方抓取」或「自定义 HTTP JSON 抓取」。默认是「沿用搜索设置」，旧配置继续按下表执行。
 
 | 选择 | 搜索 | 网页抓取 |
 |---|---|---|
@@ -323,6 +323,12 @@ Redis 仅开放 Compose 内部网络，数据由专用命名卷保存。
 外部服务地址只能由面板管理员配置，模型不能选择服务地址、请求头或密钥。这里允许管理员指定的本地/私网搜索服务；模型请求的网页及搜索结果链接仍须经过公网限制。外部 API 不跟随重定向，不自动重试，不把认证转发给其他地址。超时 15 秒、JSON 响应最多 2 MiB。容器内 `localhost` 指容器自身；跨容器接入需共享 Docker 网络并使用服务名。
 
 预设协议参考：[SearXNG](https://docs.searxng.org/dev/search_api.html)、[Tavily](https://docs.tavily.com/documentation/api-reference/endpoint/search)、[Brave Search](https://api-dashboard.search.brave.com/api-reference/web/search/get)、[Serper](https://serper.dev/)。服务的可用性、密钥和用量规则由对应服务决定。
+
+### 自定义网页抓取
+
+在「网页抓取后端」选择「自定义 HTTP JSON 抓取」，填写完整接口地址，例如 `http://fetcher:8080/fetch`。默认以 JSON POST 发送 `{"url":"https://example.com/"}` 并读取响应的 `text` 正文字段和 `title` 标题字段。GET 使用查询参数。字段路径支持点分隔，例如 `data.markdown`。
+
+抓取密钥和搜索密钥分开保存。填了最终网址路径时，网关会检查服务返回的最终网址。自建服务仍需校验目标和重定向，网关只能核对送出的请求及服务报告的结果。抓取 API 本身的重定向不跟随，正文最多 20000 字。
 
 ### 可选的 Qoder 官方搜索 / 网页抓取（国内版 / 国际版）
 

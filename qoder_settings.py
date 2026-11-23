@@ -426,7 +426,9 @@ def web_tools_config(accounts_dir):
     profiles = {name: external.normalize(saved.get(name) or {}, name)
                 for name in external.PROVIDERS}
     return {"backend": data.get("web_tools_backend") or "local",
-            "external": profiles[provider], "external_profiles": profiles}
+            "external": profiles[provider], "external_profiles": profiles,
+            "fetch_backend": data.get("web_fetch_backend") or "inherit",
+            "external_fetch": external.normalize_fetch(data.get("web_fetch_external") or {})}
 
 
 def set_web_tools_config(accounts_dir, updates):
@@ -434,7 +436,7 @@ def set_web_tools_config(accounts_dir, updates):
     import qoder_external_web as external
     if not isinstance(updates, dict):
         raise ValueError("web tools settings must be an object")
-    if set(updates) - {"enabled", "backend", "external"}:
+    if set(updates) - {"enabled", "backend", "external", "fetch_backend", "external_fetch"}:
         raise ValueError("unknown web tools setting")
     with _lock:
         data = load(accounts_dir)
@@ -461,10 +463,23 @@ def set_web_tools_config(accounts_dir, updates):
             profiles[provider] = external.normalize(profile, provider)
             data["web_tools_external_profiles"] = profiles
             data["web_tools_external_provider"] = provider
+        if "fetch_backend" in updates:
+            if updates["fetch_backend"] not in ("inherit", "local", "qoder", "external"):
+                raise ValueError("fetch_backend must be inherit, local, qoder or external")
+            data["web_fetch_backend"] = updates["fetch_backend"]
+        if "external_fetch" in updates:
+            patch = updates["external_fetch"]
+            if not isinstance(patch, dict) or set(patch) - set(external.FETCH_DEFAULTS):
+                raise ValueError("invalid external fetch settings")
+            fetch_profile = dict(data.get("web_fetch_external") or {})
+            fetch_profile.update(patch)
+            data["web_fetch_external"] = external.normalize_fetch(fetch_profile)
         if data.get("web_tools") is True and data.get("web_tools_backend") == "external":
             provider = data.get("web_tools_external_provider") or "searxng"
             external.normalize((data.get("web_tools_external_profiles") or {}).get(provider) or {},
                                provider, ready=True)
+        if data.get("web_tools") is True and data.get("web_fetch_backend") == "external":
+            external.normalize_fetch(data.get("web_fetch_external") or {}, ready=True)
         save(accounts_dir, data)
     return web_tools_config(accounts_dir)
 
